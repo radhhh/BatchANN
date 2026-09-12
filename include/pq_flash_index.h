@@ -28,35 +28,18 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
                                    diskann::Metric metric = diskann::Metric::L2);
     DISKANN_DLLEXPORT ~PQFlashIndex();
 
-#ifdef EXEC_ENV_OLS
-    DISKANN_DLLEXPORT int load(diskann::MemoryMappedFiles &files, uint32_t num_threads, const char *index_prefix);
-#else
     // load compressed data, and obtains the handle to the disk-resident index
     DISKANN_DLLEXPORT int load(uint32_t num_threads, const char *index_prefix);
-#endif
 
-#ifdef EXEC_ENV_OLS
-    DISKANN_DLLEXPORT int load_from_separate_paths(diskann::MemoryMappedFiles &files, uint32_t num_threads,
-                                                   const char *index_filepath, const char *pivots_filepath,
-                                                   const char *compressed_filepath);
-#else
     DISKANN_DLLEXPORT int load_from_separate_paths(uint32_t num_threads, const char *index_filepath,
                                                    const char *pivots_filepath, const char *compressed_filepath);
-#endif
 
     DISKANN_DLLEXPORT void load_cache_list(std::vector<uint32_t> &node_list);
 
-#ifdef EXEC_ENV_OLS
-    DISKANN_DLLEXPORT void generate_cache_list_from_sample_queries(MemoryMappedFiles &files, std::string sample_bin,
-                                                                   uint64_t l_search, uint64_t beamwidth,
-                                                                   uint64_t num_nodes_to_cache, uint32_t nthreads,
-                                                                   std::vector<uint32_t> &node_list);
-#else
     DISKANN_DLLEXPORT void generate_cache_list_from_sample_queries(std::string sample_bin, uint64_t l_search,
                                                                    uint64_t beamwidth, uint64_t num_nodes_to_cache,
                                                                    uint32_t num_threads,
                                                                    std::vector<uint32_t> &node_list);
-#endif
 
     DISKANN_DLLEXPORT void cache_bfs_levels(uint64_t num_nodes_to_cache, std::vector<uint32_t> &node_list,
                                             const bool shuffle = false);
@@ -235,12 +218,5 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     tsl::robin_map<uint32_t, std::vector<uint32_t>> _real_to_dummy_map;
     std::unordered_map<std::string, LabelT> _label_map;
 
-#ifdef EXEC_ENV_OLS
-    // Set to a larger value than the actual header to accommodate
-    // any additions we make to the header. This is an outer limit
-    // on how big the header can be.
-    static const int HEADER_SIZE = defaults::SECTOR_LEN;
-    char *getHeaderBytes();
-#endif
 };
 } // namespace diskann

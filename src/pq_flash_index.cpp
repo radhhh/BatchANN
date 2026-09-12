@@ -9,11 +9,7 @@
 #include "pq_flash_index.h"
 #include "cosine_similarity.h"
 
-#ifdef _WINDOWS
-#include "windows_aligned_file_reader.h"
-#else
 #include "linux_aligned_file_reader.h"
-#endif
 
 #define READ_U64(stream, val) stream.read((char *)&val, sizeof(uint64_t))
 #define READ_U32(stream, val) stream.read((char *)&val, sizeof(uint32_t))
@@ -57,12 +53,10 @@ PQFlashIndex<T, LabelT>::PQFlashIndex(std::shared_ptr<AlignedFileReader> &fileRe
 
 template <typename T, typename LabelT> PQFlashIndex<T, LabelT>::~PQFlashIndex()
 {
-#ifndef EXEC_ENV_OLS
     if (data != nullptr)
     {
         delete[] data;
     }
-#endif
 
     if (_centroid_data != nullptr)
         aligned_free(_centroid_data);
@@ -173,14 +167,6 @@ std::vector<bool> PQFlashIndex<T, LabelT>::read_nodes(const std::vector<uint32_t
     // copy reads into buffers
     for (uint32_t i = 0; i < read_reqs.size(); i++)
     {
-#if defined(_WINDOWS) && defined(USE_BING_INFRA) // this block is to handle failed reads in
-                                                 // production settings
-        if ((*ctx.m_pRequestsStatus)[i] != IOContext::READ_SUCCESS)
-        {
-            retval[i] = false;
-            continue;
-        }
-#endif
 
         char *node_buf = offset_to_node((char *)read_reqs[i].buf, node_ids[i]);
 
@@ -252,21 +238,12 @@ template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::load_cache_
     diskann::cout << "..done." << std::endl;
 }
 
-#ifdef EXEC_ENV_OLS
-template <typename T, typename LabelT>
-void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(MemoryMappedFiles &files, std::string sample_bin,
-                                                                      uint64_t l_search, uint64_t beamwidth,
-                                                                      uint64_t num_nodes_to_cache, uint32_t nthreads,
-                                                                      std::vector<uint32_t> &node_list)
-{
-#else
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::string sample_bin, uint64_t l_search,
                                                                       uint64_t beamwidth, uint64_t num_nodes_to_cache,
                                                                       uint32_t nthreads,
                                                                       std::vector<uint32_t> &node_list)
 {
-#endif
     if (num_nodes_to_cache >= this->_num_points)
     {
         // for small num_points and big num_nodes_to_cache, use below way to get the node_list quickly
@@ -290,17 +267,10 @@ void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::strin
     uint64_t sample_num, sample_dim, sample_aligned_dim;
     T *samples;
 
-#ifdef EXEC_ENV_OLS
-    if (files.fileExists(sample_bin))
-    {
-        diskann::load_aligned_bin<T>(files, sample_bin, samples, sample_num, sample_dim, sample_aligned_dim);
-    }
-#else
     if (file_exists(sample_bin))
     {
         diskann::load_aligned_bin<T>(sample_bin, samples, sample_num, sample_dim, sample_aligned_dim);
     }
-#endif
     else
     {
         diskann::cerr << "Sample bin file not found. Not generating cache." << std::endl;
@@ -753,38 +723,19 @@ template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::set_univers
     _universal_filter_label = label;
 }
 
-#ifdef EXEC_ENV_OLS
-template <typename T, typename LabelT>
-int PQFlashIndex<T, LabelT>::load(MemoryMappedFiles &files, uint32_t num_threads, const char *index_prefix)
-{
-#else
 template <typename T, typename LabelT> int PQFlashIndex<T, LabelT>::load(uint32_t num_threads, const char *index_prefix)
 {
-#endif
     std::string pq_table_bin = std::string(index_prefix) + "_pq_pivots.bin";
     std::string pq_compressed_vectors = std::string(index_prefix) + "_pq_compressed.bin";
     std::string _disk_index_file = std::string(index_prefix) + "_disk.index";
-#ifdef EXEC_ENV_OLS
-    return load_from_separate_paths(files, num_threads, _disk_index_file.c_str(), pq_table_bin.c_str(),
-                                    pq_compressed_vectors.c_str());
-#else
     return load_from_separate_paths(num_threads, _disk_index_file.c_str(), pq_table_bin.c_str(),
                                     pq_compressed_vectors.c_str());
-#endif
 }
 
-#ifdef EXEC_ENV_OLS
-template <typename T, typename LabelT>
-int PQFlashIndex<T, LabelT>::load_from_separate_paths(diskann::MemoryMappedFiles &files, uint32_t num_threads,
-                                                      const char *index_filepath, const char *pivots_filepath,
-                                                      const char *compressed_filepath)
-{
-#else
 template <typename T, typename LabelT>
 int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, const char *index_filepath,
                                                       const char *pivots_filepath, const char *compressed_filepath)
 {
-#endif
     std::string pq_table_bin = pivots_filepath;
     std::string pq_compressed_vectors = compressed_filepath;
     std::string _disk_index_file = index_filepath;
@@ -798,11 +749,7 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     size_t num_pts_in_label_file = 0;
 
     size_t pq_file_dim, pq_file_num_centroids;
-#ifdef EXEC_ENV_OLS
-    get_bin_metadata(files, pq_table_bin, pq_file_num_centroids, pq_file_dim, METADATA_SIZE);
-#else
     get_bin_metadata(pq_table_bin, pq_file_num_centroids, pq_file_dim, METADATA_SIZE);
-#endif
 
     this->_disk_index_file = _disk_index_file;
 
@@ -819,20 +766,10 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     this->_aligned_dim = ROUND_UP(pq_file_dim, 8);
 
     size_t npts_u64, nchunks_u64;
-#ifdef EXEC_ENV_OLS
-    diskann::load_bin<uint8_t>(files, pq_compressed_vectors, this->data, npts_u64, nchunks_u64);
-#else
     diskann::load_bin<uint8_t>(pq_compressed_vectors, this->data, npts_u64, nchunks_u64);
-#endif
 
     this->_num_points = npts_u64;
     this->_n_chunks = nchunks_u64;
-#ifdef EXEC_ENV_OLS
-    if (files.fileExists(labels_file))
-    {
-        FileContent &content_labels = files.getContent(labels_file);
-        std::stringstream infile(std::string((const char *)content_labels._content, content_labels._size));
-#else
     if (file_exists(labels_file))
     {
         std::ifstream infile(labels_file, std::ios::binary);
@@ -840,38 +777,20 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
         {
             throw diskann::ANNException(std::string("Failed to open file ") + labels_file, -1);
         }
-#endif
         parse_label_file(infile, num_pts_in_label_file);
         assert(num_pts_in_label_file == this->_num_points);
 
-#ifndef EXEC_ENV_OLS
         infile.close();
-#endif
 
-#ifdef EXEC_ENV_OLS
-        FileContent &content_labels_map = files.getContent(labels_map_file);
-        std::stringstream map_reader(std::string((const char *)content_labels_map._content, content_labels_map._size));
-#else
         std::ifstream map_reader(labels_map_file);
-#endif
         _label_map = load_label_map(map_reader);
 
-#ifndef EXEC_ENV_OLS
         map_reader.close();
-#endif
 
-#ifdef EXEC_ENV_OLS
-        if (files.fileExists(labels_to_medoids))
-        {
-            FileContent &content_labels_to_meoids = files.getContent(labels_to_medoids);
-            std::stringstream medoid_stream(
-                std::string((const char *)content_labels_to_meoids._content, content_labels_to_meoids._size));
-#else
         if (file_exists(labels_to_medoids))
         {
             std::ifstream medoid_stream(labels_to_medoids);
             assert(medoid_stream.is_open());
-#endif
             std::string line, token;
 
             _filter_to_medoid_ids.clear();
@@ -901,39 +820,21 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
         }
         std::string univ_label_file = std ::string(_disk_index_file) + "_universal_label.txt";
 
-#ifdef EXEC_ENV_OLS
-        if (files.fileExists(univ_label_file))
-        {
-            FileContent &content_univ_label = files.getContent(univ_label_file);
-            std::stringstream universal_label_reader(
-                std::string((const char *)content_univ_label._content, content_univ_label._size));
-#else
         if (file_exists(univ_label_file))
         {
             std::ifstream universal_label_reader(univ_label_file);
             assert(universal_label_reader.is_open());
-#endif
             std::string univ_label;
             universal_label_reader >> univ_label;
-#ifndef EXEC_ENV_OLS
             universal_label_reader.close();
-#endif
             LabelT label_as_num = (LabelT)std::stoul(univ_label);
             set_universal_label(label_as_num);
         }
 
-#ifdef EXEC_ENV_OLS
-        if (files.fileExists(dummy_map_file))
-        {
-            FileContent &content_dummy_map = files.getContent(dummy_map_file);
-            std::stringstream dummy_map_stream(
-                std::string((const char *)content_dummy_map._content, content_dummy_map._size));
-#else
         if (file_exists(dummy_map_file))
         {
             std::ifstream dummy_map_stream(dummy_map_file);
             assert(dummy_map_stream.is_open());
-#endif
             std::string line, token;
 
             while (std::getline(dummy_map_stream, line))
@@ -959,18 +860,12 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
 
                 _real_to_dummy_map[real_id].emplace_back(dummy_id);
             }
-#ifndef EXEC_ENV_OLS
             dummy_map_stream.close();
-#endif
             diskann::cout << "Loaded dummy map" << std::endl;
         }
     }
 
-#ifdef EXEC_ENV_OLS
-    _pq_table.load_pq_centroid_bin(files, pq_table_bin.c_str(), nchunks_u64);
-#else
     _pq_table.load_pq_centroid_bin(pq_table_bin.c_str(), nchunks_u64);
-#endif
 
     diskann::cout << "Loaded PQ centroids and in-memory compressed vectors. #points: " << _num_points
                   << " #dim: " << _data_dim << " #aligned_dim: " << _aligned_dim << " #chunks: " << _n_chunks
@@ -986,21 +881,12 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     }
 
     std::string disk_pq_pivots_path = this->_disk_index_file + "_pq_pivots.bin";
-#ifdef EXEC_ENV_OLS
-    if (files.fileExists(disk_pq_pivots_path))
-    {
-        _use_disk_index_pq = true;
-        // giving 0 chunks to make the _pq_table infer from the
-        // chunk_offsets file the correct value
-        _disk_pq_table.load_pq_centroid_bin(files, disk_pq_pivots_path.c_str(), 0);
-#else
     if (file_exists(disk_pq_pivots_path))
     {
         _use_disk_index_pq = true;
         // giving 0 chunks to make the _pq_table infer from the
         // chunk_offsets file the correct value
         _disk_pq_table.load_pq_centroid_bin(disk_pq_pivots_path.c_str(), 0);
-#endif
         _disk_pq_n_chunks = _disk_pq_table.get_num_chunks();
         _disk_bytes_per_point =
             _disk_pq_n_chunks * sizeof(uint8_t); // revising disk_bytes_per_point since DISK PQ is used.
@@ -1009,22 +895,7 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     }
 
 // read index metadata
-#ifdef EXEC_ENV_OLS
-    // This is a bit tricky. We have to read the header from the
-    // disk_index_file. But  this is now exclusively a preserve of the
-    // DiskPriorityIO class. So, we need to estimate how many
-    // bytes are needed to store the header and read in that many using our
-    // 'standard' aligned file reader approach.
-    reader->open(_disk_index_file);
-    this->setup_thread_data(num_threads);
-    this->_max_nthreads = num_threads;
-
-    char *bytes = getHeaderBytes();
-    ContentBuf buf(bytes, HEADER_SIZE);
-    std::basic_istream<char> index_metadata(&buf);
-#else
     std::ifstream index_metadata(_disk_index_file, std::ios::binary);
-#endif
 
     uint32_t nr, nc; // metadata itself is stored as bin format (nr is number of
                      // metadata, nc should be 1)
@@ -1090,32 +961,19 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     diskann::cout << ", max node len (bytes): " << _max_node_len;
     diskann::cout << ", max node degree: " << _max_degree << std::endl;
 
-#ifdef EXEC_ENV_OLS
-    delete[] bytes;
-#else
     index_metadata.close();
-#endif
 
-#ifndef EXEC_ENV_OLS
     // open AlignedFileReader handle to index_file
     std::string index_fname(_disk_index_file);
     reader->open(index_fname);
     this->setup_thread_data(num_threads);
     this->_max_nthreads = num_threads;
 
-#endif
 
-#ifdef EXEC_ENV_OLS
-    if (files.fileExists(medoids_file))
-    {
-        size_t tmp_dim;
-        diskann::load_bin<uint32_t>(files, norm_file, medoids_file, _medoids, _num_medoids, tmp_dim);
-#else
     if (file_exists(medoids_file))
     {
         size_t tmp_dim;
         diskann::load_bin<uint32_t>(medoids_file, _medoids, _num_medoids, tmp_dim);
-#endif
 
         if (tmp_dim != 1)
         {
@@ -1125,13 +983,8 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
                    << std::endl;
             throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
         }
-#ifdef EXEC_ENV_OLS
-        if (!files.fileExists(centroids_file))
-        {
-#else
         if (!file_exists(centroids_file))
         {
-#endif
             diskann::cout << "Centroid data file not found. Using corresponding vectors "
                              "for the medoids "
                           << std::endl;
@@ -1140,12 +993,7 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
         else
         {
             size_t num_centroids, aligned_tmp_dim;
-#ifdef EXEC_ENV_OLS
-            diskann::load_aligned_bin<float>(files, centroids_file, _centroid_data, num_centroids, tmp_dim,
-                                             aligned_tmp_dim);
-#else
             diskann::load_aligned_bin<float>(centroids_file, _centroid_data, num_centroids, tmp_dim, aligned_tmp_dim);
-#endif
             if (aligned_tmp_dim != _aligned_dim || num_centroids != _num_medoids)
             {
                 std::stringstream stream;
@@ -1169,19 +1017,11 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
 
     std::string norm_file = std::string(_disk_index_file) + "_max_base_norm.bin";
 
-#ifdef EXEC_ENV_OLS
-    if (files.fileExists(norm_file) && metric == diskann::Metric::INNER_PRODUCT)
-    {
-        uint64_t dumr, dumc;
-        float *norm_val;
-        diskann::load_bin<float>(files, norm_val, dumr, dumc);
-#else
     if (file_exists(norm_file) && metric == diskann::Metric::INNER_PRODUCT)
     {
         uint64_t dumr, dumc;
         float *norm_val;
         diskann::load_bin<float>(norm_file, norm_val, dumr, dumc);
-#endif
         this->_max_base_norm = norm_val[0];
         diskann::cout << "Setting re-scaling factor of base vectors to " << this->_max_base_norm << std::endl;
         delete[] norm_val;
@@ -1190,49 +1030,6 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     return 0;
 }
 
-#ifdef USE_BING_INFRA
-bool getNextCompletedRequest(std::shared_ptr<AlignedFileReader> &reader, IOContext &ctx, size_t size,
-                             int &completedIndex)
-{
-    if ((*ctx.m_pRequests)[0].m_callback)
-    {
-        bool waitsRemaining = false;
-        long completeCount = ctx.m_completeCount;
-        do
-        {
-            for (int i = 0; i < size; i++)
-            {
-                auto ithStatus = (*ctx.m_pRequestsStatus)[i];
-                if (ithStatus == IOContext::Status::READ_SUCCESS)
-                {
-                    completedIndex = i;
-                    return true;
-                }
-                else if (ithStatus == IOContext::Status::READ_WAIT)
-                {
-                    waitsRemaining = true;
-                }
-            }
-
-            // if we didn't find one in READ_SUCCESS, wait for one to complete.
-            if (waitsRemaining)
-            {
-                WaitOnAddress(&ctx.m_completeCount, &completeCount, sizeof(completeCount), 100);
-                // this assumes the knowledge of the reader behavior (implicit
-                // contract). need better factoring?
-            }
-        } while (waitsRemaining);
-
-        completedIndex = -1;
-        return false;
-    }
-    else
-    {
-        reader->wait(ctx, completedIndex);
-        return completedIndex != -1;
-    }
-}
-#endif
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
@@ -1470,12 +1267,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 num_ios++;
             }
             io_timer.reset();
-#ifdef USE_BING_INFRA
-            reader->read(frontier_read_reqs, ctx,
-                         true); // asynhronous reader for Bing.
-#else
             reader->read(frontier_read_reqs, ctx); // synchronous IO linux
-#endif
             if (stats != nullptr)
             {
                 stats->io_us += (float)io_timer.elapsed();
@@ -1533,21 +1325,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 }
             }
         }
-#ifdef USE_BING_INFRA
-        // process each frontier nhood - compute distances to unvisited nodes
-        int completedIndex = -1;
-        long requestCount = static_cast<long>(frontier_read_reqs.size());
-        // If we issued read requests and if a read is complete or there are
-        // reads in wait state, then enter the while loop.
-        while (requestCount > 0 && getNextCompletedRequest(reader, ctx, requestCount, completedIndex))
-        {
-            assert(completedIndex >= 0);
-            auto &frontier_nhood = frontier_nhoods[completedIndex];
-            (*ctx.m_pRequestsStatus)[completedIndex] = IOContext::PROCESS_COMPLETE;
-#else
         for (auto &frontier_nhood : frontier_nhoods)
         {
-#endif
             char *node_disk_buf = offset_to_node(frontier_nhood.second, frontier_nhood.first);
             uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
             uint64_t nnbrs = (uint64_t)(*node_buf);
@@ -1642,11 +1421,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         }
 
         io_timer.reset();
-#ifdef USE_BING_INFRA
-        reader->read(vec_read_reqs, ctx, true); // async reader windows.
-#else
         reader->read(vec_read_reqs, ctx); // synchronous IO linux
-#endif
         if (stats != nullptr)
         {
             stats->io_us += io_timer.elapsed();
@@ -1688,9 +1463,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         }
     }
 
-#ifdef USE_BING_INFRA
-    ctx.m_completeCount = 0;
-#endif
 
     if (stats != nullptr)
     {
@@ -1752,23 +1524,6 @@ template <typename T, typename LabelT> diskann::Metric PQFlashIndex<T, LabelT>::
     return this->metric;
 }
 
-#ifdef EXEC_ENV_OLS
-template <typename T, typename LabelT> char *PQFlashIndex<T, LabelT>::getHeaderBytes()
-{
-    IOContext &ctx = reader->get_ctx();
-    AlignedRead readReq;
-    readReq.buf = new char[PQFlashIndex<T, LabelT>::HEADER_SIZE];
-    readReq.len = PQFlashIndex<T, LabelT>::HEADER_SIZE;
-    readReq.offset = 0;
-
-    std::vector<AlignedRead> readReqs;
-    readReqs.push_back(readReq);
-
-    reader->read(readReqs, ctx, false);
-
-    return (char *)readReq.buf;
-}
-#endif
 
 template <typename T, typename LabelT>
 std::vector<std::uint8_t> PQFlashIndex<T, LabelT>::get_pq_vector(std::uint64_t vid)
