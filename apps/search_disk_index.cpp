@@ -16,6 +16,7 @@
 
 #ifndef _WINDOWS
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "linux_aligned_file_reader.h"
@@ -30,6 +31,125 @@
 #define WARMUP false
 
 namespace po = boost::program_options;
+
+// Counters of the machine and of this process at one instant. Two of them, taken right before and
+// right after the timed query loop, let a driver script compute what happened during the queries
+// only; index loading and cache building stay out of the difference.
+struct ProcSnapshot
+{
+    std::string cpu_line;                // aggregate "cpu" line of /proc/stat (whole machine)
+    std::vector<std::string> disk_lines; // every line of /proc/diskstats (one per drive or partition)
+    // This process only, all threads, from getrusage(). Excludes other programs on the machine.
+    uint64_t user_us = 0;        // CPU time in the program's own code
+    uint64_t system_us = 0;      // CPU time the kernel spent on its behalf, e.g. submitting reads
+    int64_t vol_switches = 0;    // thread went to sleep by itself, e.g. to wait for a read
+    int64_t invol_switches = 0;  // thread was taken off its core
+};
+
+// Performance record of one L value. Collected in a vector during the search and written to
+// --perf_file after the last L, the same way the search results are kept and saved.
+struct PerfRecord
+{
+    uint32_t L = 0;
+    uint32_t W = 0;
+    uint32_t T = 0;
+    ProcSnapshot begin;
+    ProcSnapshot end;
+    double wall_seconds = 0;
+};
+
+ProcSnapshot take_proc_snapshot()
+{
+    ProcSnapshot snap;
+#ifndef _WINDOWS
+    std::ifstream stat_file("/proc/stat");
+    if (stat_file.is_open())
+        std::getline(stat_file, snap.cpu_line);
+    std::ifstream disk_file("/proc/diskstats");
+    std::string line;
+    while (disk_file.is_open() && std::getline(disk_file, line))
+        snap.disk_lines.push_back(line);
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+    {
+        snap.user_us = (uint64_t)ru.ru_utime.tv_sec * 1000000ULL + (uint64_t)ru.ru_utime.tv_usec;
+        snap.system_us = (uint64_t)ru.ru_stime.tv_sec * 1000000ULL + (uint64_t)ru.ru_stime.tv_usec;
+        snap.vol_switches = ru.ru_nvcsw;
+        snap.invol_switches = ru.ru_nivcsw;
+    }
+#endif
+    return snap;
+}
+
+// Text file, one block per L: a PERF header line, the begin and end snapshots as PROCSNAP lines,
+// then a WALL line. Parsed by scripts/measure/run_bottleneck.py.
+void save_perf_records(const std::string &path, const std::vector<PerfRecord> &records)
+{
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    for (const auto &rec : records)
+    {
+        if (rec.T == 0) // slot of an L value that was skipped (L < K), never filled
+            continue;
+        out << "PERF L=" << rec.L << " W=" << rec.W << " T=" << rec.T << std::endl;
+        const std::pair<const char *, const ProcSnapshot *> snaps[2] = {{"begin", &rec.begin}, {"end", &rec.end}};
+        for (const auto &ts : snaps)
+        {
+            out << "PROCSNAP " << ts.first << " stat " << ts.second->cpu_line << std::endl;
+            for (const auto &line : ts.second->disk_lines)
+                out << "PROCSNAP " << ts.first << " diskstats " << line << std::endl;
+            out << "PROCSNAP " << ts.first << " rusage " << ts.second->user_us << " " << ts.second->system_us << " "
+                << ts.second->vol_switches << " " << ts.second->invol_switches << std::endl;
+        }
+        out << "WALL L=" << rec.L << " seconds=" << rec.wall_seconds << std::endl;
+    }
+    out.close();
+}
+
+// Binary trace file, little-endian. See RESEARCH_PLAN.md / scripts/measure/common.py.
+struct TraceHeader
+{
+    uint32_t magic = 0x54524331; // "TRC1"
+    uint32_t version = 1;
+    uint32_t nq = 0;
+    uint32_t L = 0;
+    uint32_t W = 0;
+    uint32_t n_cached = 0;
+    uint64_t total_records = 0;
+    uint32_t reserved[2] = {0, 0};
+};
+
+void write_trace(const std::string &path, const diskann::QueryStats *stats, uint64_t nq, uint32_t L, uint32_t W,
+                 uint32_t n_cached)
+{
+    TraceHeader hdr;
+    hdr.nq = (uint32_t)nq;
+    hdr.L = L;
+    hdr.W = W;
+    hdr.n_cached = n_cached;
+    std::vector<uint32_t> counts(nq), ios(nq), hits(nq), hops(nq);
+    uint64_t sum_ios = 0, sum_hits = 0;
+    for (uint64_t i = 0; i < nq; i++)
+    {
+        counts[i] = (uint32_t)(stats[i].trace.size() / 2);
+        ios[i] = stats[i].n_ios;
+        hits[i] = stats[i].n_cache_hits;
+        hops[i] = stats[i].n_hops;
+        hdr.total_records += counts[i];
+        sum_ios += ios[i];
+        sum_hits += hits[i];
+    }
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr));
+    out.write(reinterpret_cast<const char *>(counts.data()), nq * sizeof(uint32_t));
+    out.write(reinterpret_cast<const char *>(ios.data()), nq * sizeof(uint32_t));
+    out.write(reinterpret_cast<const char *>(hits.data()), nq * sizeof(uint32_t));
+    out.write(reinterpret_cast<const char *>(hops.data()), nq * sizeof(uint32_t));
+    for (uint64_t i = 0; i < nq; i++)
+        out.write(reinterpret_cast<const char *>(stats[i].trace.data()), stats[i].trace.size() * sizeof(uint32_t));
+    out.close();
+    diskann::cout << "TRACE file=" << path << " nq=" << nq << " records=" << hdr.total_records << " sum_ios=" << sum_ios
+                  << " sum_hits=" << sum_hits << std::endl;
+}
 
 void print_stats(std::string category, std::vector<float> percentiles, std::vector<float> results)
 {
@@ -53,7 +173,9 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const uint32_t num_threads, const uint32_t recall_at, const uint32_t beamwidth,
                       const uint32_t num_nodes_to_cache, const uint32_t search_io_limit,
                       const std::vector<uint32_t> &Lvec, const float fail_if_recall_below,
-                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false)
+                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false,
+                      const std::string &trace_file = "", const std::string &cache_list_file = "",
+                      const std::string &perf_file = "")
 {
     diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
     if (beamwidth <= 0)
@@ -125,6 +247,12 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     // if (num_nodes_to_cache > 0)
     //     _pFlashIndex->generate_cache_list_from_sample_queries(warmup_query_file, 15, 6, num_nodes_to_cache,
     //     num_threads, node_list);
+    if (!cache_list_file.empty())
+    {
+        diskann::cout << "Cache list holds " << node_list.size() << " nodes" << std::endl;
+        diskann::save_bin<uint32_t>(cache_list_file, node_list.data(), node_list.size(), 1);
+    }
+    const uint32_t n_cached = (uint32_t)node_list.size();
     _pFlashIndex->load_cache_list(node_list);
     node_list.clear();
     node_list.shrink_to_fit();
@@ -197,6 +325,10 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
     double best_recall = 0.0;
 
+    // One performance record per L, indexed like the results. Filled only when --perf_file is given
+    // and saved after the search.
+    std::vector<PerfRecord> perf_records(Lvec.size());
+
     for (uint32_t test_id = 0; test_id < Lvec.size(); test_id++)
     {
         uint32_t L = Lvec[test_id];
@@ -220,8 +352,13 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         query_result_dists[test_id].resize(recall_at * query_num);
 
         auto stats = new diskann::QueryStats[query_num];
+        if (!trace_file.empty())
+            for (size_t i = 0; i < query_num; i++)
+                stats[i].record_trace = true;
 
         std::vector<uint64_t> query_result_ids_64(recall_at * query_num);
+        if (!perf_file.empty())
+            perf_records[test_id].begin = take_proc_snapshot();
         auto s = std::chrono::high_resolution_clock::now();
 
 #pragma omp parallel for schedule(dynamic, 1)
@@ -254,6 +391,14 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         auto e = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> diff = e - s;
         double qps = (1.0 * query_num) / (1.0 * diff.count());
+        if (!perf_file.empty())
+        {
+            perf_records[test_id].end = take_proc_snapshot();
+            perf_records[test_id].L = L;
+            perf_records[test_id].W = optimized_beamwidth;
+            perf_records[test_id].T = num_threads;
+            perf_records[test_id].wall_seconds = diff.count();
+        }
 
         diskann::convert_types<uint64_t, uint32_t>(query_result_ids_64.data(), query_result_ids[test_id].data(),
                                                    query_num, recall_at);
@@ -290,6 +435,9 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         }
         else
             diskann::cout << std::endl;
+        if (!trace_file.empty())
+            write_trace(trace_file + "_L" + std::to_string(L) + ".trace", stats, query_num, L, optimized_beamwidth,
+                        n_cached);
         delete[] stats;
     }
 
@@ -306,6 +454,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         cur_result_path = result_output_prefix + "_" + std::to_string(L) + "_dists_float.bin";
         diskann::save_bin<float>(cur_result_path, query_result_dists[test_id++].data(), query_num, recall_at);
     }
+    if (!perf_file.empty())
+        save_perf_records(perf_file, perf_records);
 
     diskann::aligned_free(query);
     if (warmup != nullptr)
@@ -316,7 +466,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 int main(int argc, char **argv)
 {
     std::string data_type, dist_fn, index_path_prefix, result_path_prefix, query_file, gt_file, filter_label,
-        label_type, query_filters_file;
+        label_type, query_filters_file, trace_file, cache_list_file, perf_file;
     uint32_t num_threads, K, W, num_nodes_to_cache, search_io_limit;
     std::vector<uint32_t> Lvec;
     bool use_reorder_data = false;
@@ -375,6 +525,15 @@ int main(int argc, char **argv)
         optional_configs.add_options()("fail_if_recall_below",
                                        po::value<float>(&fail_if_recall_below)->default_value(0.0f),
                                        program_options_utils::FAIL_IF_RECALL_BELOW);
+        optional_configs.add_options()("trace_file", po::value<std::string>(&trace_file)->default_value(""),
+                                       "If set, record every expanded node per query (hop, cache/disk) and write "
+                                       "<trace_file>_L<L>.trace for each L. Default: off");
+        optional_configs.add_options()("perf_file", po::value<std::string>(&perf_file)->default_value(""),
+                                       "If set, write a performance record to this text file: machine CPU, drive and "
+                                       "process counters right before and after the timed query loop, plus the wall "
+                                       "time, one block per L. Used by scripts/measure/run_bottleneck.py. Default: off");
+        optional_configs.add_options()("cache_list_file", po::value<std::string>(&cache_list_file)->default_value(""),
+                                       "If set, save the ids of the statically cached nodes to this .bin file");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -454,15 +613,15 @@ int main(int argc, char **argv)
             if (data_type == std::string("float"))
                 return search_disk_index<float, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, trace_file, cache_list_file, perf_file);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, trace_file, cache_list_file, perf_file);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, trace_file, cache_list_file, perf_file);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;
@@ -474,15 +633,15 @@ int main(int argc, char **argv)
             if (data_type == std::string("float"))
                 return search_disk_index<float>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                 num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                fail_if_recall_below, query_filters, use_reorder_data);
+                                                fail_if_recall_below, query_filters, use_reorder_data, trace_file, cache_list_file, perf_file);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                  num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                 fail_if_recall_below, query_filters, use_reorder_data);
+                                                 fail_if_recall_below, query_filters, use_reorder_data, trace_file, cache_list_file, perf_file);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                   num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                  fail_if_recall_below, query_filters, use_reorder_data);
+                                                  fail_if_recall_below, query_filters, use_reorder_data, trace_file, cache_list_file, perf_file);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;

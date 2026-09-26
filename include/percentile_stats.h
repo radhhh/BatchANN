@@ -33,6 +33,13 @@ struct QueryStats
     unsigned n_cmps = 0;       // # cmps
     unsigned n_cache_hits = 0; // # cache_hits
     unsigned n_hops = 0;       // # search hops
+
+    // Optional per-query trace of expanded nodes, filled only when record_trace is true.
+    // Records are interleaved pairs (node_id, meta) with meta = (hop << 1) | from_cache,
+    // where hop is the 0-based index of the outer search round and from_cache is 1 when the
+    // node was served from the static cache and 0 when it was read from disk.
+    bool record_trace = false;
+    std::vector<uint32_t> trace;
 };
 
 template <typename T>

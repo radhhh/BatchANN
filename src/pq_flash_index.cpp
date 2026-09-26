@@ -325,15 +325,17 @@ void PQFlashIndex<T, LabelT>::cache_bfs_levels(uint64_t num_nodes_to_cache, std:
 
     tsl::robin_set<uint32_t> node_set;
 
-    // Do not cache more than 10% of the nodes in the index
-    uint64_t tenp_nodes = (uint64_t)(std::round(this->_num_points * 0.1));
-    if (num_nodes_to_cache > tenp_nodes)
+    // The cache may cover the whole index; the caller chooses the size. Clamp to the point count
+    // and report the memory the cache will take so an oversized request is visible.
+    if (num_nodes_to_cache > this->_num_points)
     {
-        diskann::cout << "Reducing nodes to cache from: " << num_nodes_to_cache << " to: " << tenp_nodes
-                      << "(10 percent of total nodes:" << this->_num_points << ")" << std::endl;
-        num_nodes_to_cache = tenp_nodes == 0 ? 1 : tenp_nodes;
+        diskann::cout << "Reducing nodes to cache from: " << num_nodes_to_cache << " to: " << this->_num_points
+                      << " (total nodes in index)" << std::endl;
+        num_nodes_to_cache = this->_num_points;
     }
-    diskann::cout << "Caching " << num_nodes_to_cache << "..." << std::endl;
+    diskann::cout << "Caching " << num_nodes_to_cache << " nodes, about "
+                  << (num_nodes_to_cache * (_max_node_len + sizeof(uint32_t))) / (1024 * 1024) << " MiB..."
+                  << std::endl;
 
     std::unique_ptr<tsl::robin_set<uint32_t>> cur_level, prev_level;
     cur_level = std::make_unique<tsl::robin_set<uint32_t>>();
@@ -1232,11 +1234,21 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 if (stats != nullptr)
                 {
                     stats->n_cache_hits++;
+                    if (stats->record_trace)
+                    {
+                        stats->trace.push_back(nbr.id);
+                        stats->trace.push_back((hops << 1) | 1u);
+                    }
                 }
             }
             else
             {
                 frontier.push_back(nbr.id);
+                if (stats != nullptr && stats->record_trace)
+                {
+                    stats->trace.push_back(nbr.id);
+                    stats->trace.push_back(hops << 1);
+                }
             }
             if (this->_count_visited_nodes)
             {
