@@ -220,6 +220,28 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         calc_recall_flag = true;
     }
 
+    // An index built with --num_clusters is renumbered on disk. Its _perm.bin maps a disk id
+    // back to the original point id, so results are compared to the original ground truth.
+    // Traces and cache lists stay in disk ids on purpose: they describe sectors.
+    std::vector<uint32_t> layout_perm;
+    {
+        std::string perm_file = index_path_prefix + "_disk.index_perm.bin";
+        if (file_exists(perm_file))
+        {
+            std::unique_ptr<uint32_t[]> perm_data;
+            size_t perm_n = 0, perm_dim = 0;
+            diskann::load_bin<uint32_t>(perm_file, perm_data, perm_n, perm_dim);
+            if (perm_dim != 1)
+            {
+                diskann::cout << "Error. " << perm_file << " must be an N x 1 file" << std::endl;
+                return -1;
+            }
+            layout_perm.assign(perm_data.get(), perm_data.get() + perm_n);
+            diskann::cout << "Layout permutation found (" << perm_n
+                          << " ids); result ids are mapped back to original ids" << std::endl;
+        }
+    }
+
     std::shared_ptr<AlignedFileReader> reader = nullptr;
 #ifdef _WINDOWS
 #ifndef USE_BING_INFRA
@@ -402,6 +424,17 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
         diskann::convert_types<uint64_t, uint32_t>(query_result_ids_64.data(), query_result_ids[test_id].data(),
                                                    query_num, recall_at);
+        if (!layout_perm.empty())
+        {
+            for (auto &id : query_result_ids[test_id])
+            {
+                if (id >= layout_perm.size())
+                    throw diskann::ANNException("Result id outside the layout permutation; the _perm.bin file "
+                                                "does not belong to this index",
+                                                -1, __FUNCSIG__, __FILE__, __LINE__);
+                id = layout_perm[id];
+            }
+        }
 
         auto mean_latency = diskann::get_mean_stats<float>(
             stats, query_num, [](const diskann::QueryStats &stats) { return stats.total_us; });

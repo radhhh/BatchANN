@@ -17,7 +17,8 @@ int main(int argc, char **argv)
 {
     std::string data_type, dist_fn, data_path, index_path_prefix, codebook_prefix, label_file, universal_label,
         label_type;
-    uint32_t num_threads, R, L, disk_PQ, build_PQ, QD, Lf, filter_threshold;
+    uint32_t num_threads, R, L, disk_PQ, build_PQ, QD, Lf, filter_threshold, num_clusters;
+    std::string layout_mode;
     float B, M;
     bool append_reorder_data = false;
     bool use_opq = false;
@@ -78,6 +79,14 @@ int main(int argc, char **argv)
                                        "internally where each node has a maximum F labels.");
         optional_configs.add_options()("label_type", po::value<std::string>(&label_type)->default_value("uint"),
                                        program_options_utils::LABEL_TYPE_DESCRIPTION);
+        optional_configs.add_options()("num_clusters", po::value<uint32_t>(&num_clusters)->default_value(0),
+                                       "Locality-aware disk layout: cluster the points with balanced k-means "
+                                       "into this many clusters and renumber them so that clusters are "
+                                       "contiguous on disk. 0 keeps the stock layout.");
+        optional_configs.add_options()("layout_mode",
+                                       po::value<std::string>(&layout_mode)->default_value("cluster_neighbor"),
+                                       "With --num_clusters: cluster_only (clusters back to back) or "
+                                       "cluster_neighbor (also packs graph neighbors into the same sector).");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -133,11 +142,18 @@ int main(int argc, char **argv)
         }
     }
 
+    if (layout_mode != "cluster_only" && layout_mode != "cluster_neighbor")
+    {
+        std::cout << "Error: --layout_mode must be cluster_only or cluster_neighbor" << std::endl;
+        return -1;
+    }
+
     std::string params = std::string(std::to_string(R)) + " " + std::string(std::to_string(L)) + " " +
                          std::string(std::to_string(B)) + " " + std::string(std::to_string(M)) + " " +
                          std::string(std::to_string(num_threads)) + " " + std::string(std::to_string(disk_PQ)) + " " +
                          std::string(std::to_string(append_reorder_data)) + " " +
-                         std::string(std::to_string(build_PQ)) + " " + std::string(std::to_string(QD));
+                         std::string(std::to_string(build_PQ)) + " " + std::string(std::to_string(QD)) + " " +
+                         std::string(std::to_string(num_clusters)) + " " + layout_mode;
 
     try
     {

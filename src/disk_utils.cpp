@@ -9,6 +9,7 @@
 
 #include "logger.h"
 #include "disk_utils.h"
+#include "layout_reorder.h"
 #include "cached_io.h"
 #include "index.h"
 #include "mkl.h"
@@ -1111,7 +1112,7 @@ int build_disk_index(const char *dataFilePath, const char *indexFilePath, const 
     {
         param_list.push_back(cur_param);
     }
-    if (param_list.size() < 5 || param_list.size() > 9)
+    if (param_list.size() < 5 || param_list.size() > 11)
     {
         diskann::cout << "Correct usage of parameters is R (max degree)\n"
                          "L (indexing list size, better if >= R)\n"
@@ -1124,7 +1125,9 @@ int build_disk_index(const char *dataFilePath, const char *indexFilePath, const 
                          ": optional paramter, use only when using disk PQ\n"
                          "build_PQ_byte (number of PQ bytes for inde build; set 0 to use "
                          "full precision vectors)\n"
-                         "QD Quantized Dimension to overwrite the derived dim from B "
+                         "QD Quantized Dimension to overwrite the derived dim from B\n"
+                         "num_clusters (optional; > 0 turns on the locality-aware layout)\n"
+                         "layout_mode (optional; cluster_only or cluster_neighbor)"
                       << std::endl;
         return -1;
     }
@@ -1166,6 +1169,21 @@ int build_disk_index(const char *dataFilePath, const char *indexFilePath, const 
     if (param_list.size() >= 8)
     {
         build_pq_bytes = atoi(param_list[7].c_str());
+    }
+
+    // Locality-aware layout (step 3b): tokens 10 and 11, both optional.
+    uint32_t num_clusters = 0;
+    std::string layout_mode = "cluster_neighbor";
+    if (param_list.size() >= 10)
+        num_clusters = (uint32_t)atoi(param_list[9].c_str());
+    if (param_list.size() >= 11)
+        layout_mode = param_list[10];
+    if (num_clusters > 0)
+    {
+        if (use_filters)
+            throw diskann::ANNException("--num_clusters (layout reorder) does not support filtered indexes", -1,
+                                        __FUNCSIG__, __FILE__, __LINE__);
+        diskann::layout::parse_layout_mode(layout_mode); // throws on an unknown value
     }
 
     std::string base_file(dataFilePath);
@@ -1328,6 +1346,24 @@ int build_disk_index(const char *dataFilePath, const char *indexFilePath, const 
                                                   labels_to_medoids_path, universal_label, Lf);
     diskann::cout << timer.elapsed_seconds_for_step("building merged vamana index") << std::endl;
 
+    // Step 3b: renumber the points so that clusters are contiguous on disk and graph neighbors
+    // share sectors. Rewrites the graph, the PQ codes and (into a temp file) the vectors; the
+    // layout writer below then runs unchanged on them.
+    std::string layout_data_path = index_prefix_path + "_layout_data.bin";
+    bool created_layout_data = false;
+    if (num_clusters > 0)
+    {
+        timer.reset();
+        diskann::reorder_for_layout<T>(data_file_to_use, mem_index_path, pq_compressed_vectors_path,
+                                       use_disk_pq ? disk_pq_compressed_vectors_path : std::string(""), medoids_path,
+                                       layout_data_path, disk_index_path,
+                                       use_disk_pq ? disk_pq_dims : dim * sizeof(T), num_clusters, layout_mode,
+                                       num_threads);
+        data_file_to_use = layout_data_path;
+        created_layout_data = true;
+        diskann::cout << timer.elapsed_seconds_for_step("reordering for layout") << std::endl;
+    }
+
     timer.reset();
     if (!use_disk_pq)
     {
@@ -1363,6 +1399,8 @@ int build_disk_index(const char *dataFilePath, const char *indexFilePath, const 
     }
     if (created_temp_file_for_processed_data)
         std::remove(prepped_base.c_str());
+    if (created_layout_data)
+        std::remove(layout_data_path.c_str());
     std::remove(mem_index_path.c_str());
     std::remove((mem_index_path + ".data").c_str());
     std::remove((mem_index_path + ".tags").c_str());
